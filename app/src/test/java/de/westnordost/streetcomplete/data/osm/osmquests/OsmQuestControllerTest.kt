@@ -30,6 +30,11 @@ import de.westnordost.streetcomplete.testutils.osmQuestKey
 import de.westnordost.streetcomplete.testutils.p
 import de.westnordost.streetcomplete.testutils.pGeom
 import de.westnordost.streetcomplete.util.ktx.containsExactlyInAnyOrder
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import org.mockito.Mockito.inOrder
 import org.mockito.Mockito.verify
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -64,7 +69,8 @@ class OsmQuestControllerTest {
             1 to NotApplicableQuestType,
             2 to ComplexQuestTypeApplicableToNode42,
             3 to ApplicableQuestTypeNotInAnyCountry,
-            4 to ApplicableQuestType2
+            4 to ApplicableQuestType2,
+            5 to OnlyApplicableForTagAQuestType
         ))
         countryBoundaries = mock()
 
@@ -357,6 +363,67 @@ class OsmQuestControllerTest {
             deletedQuestKeys = eq(expectedDeletedQuestKeys)
         )
     }
+
+    // reproducing https://github.com/streetcomplete/StreetComplete/issues/5545#issuecomment-2563881592
+    @Test fun blah2() = runBlocking {
+        // need tags, because elements without tags get kicked out early except for specific quest types that actually use them
+        val element = node(1, tags = mapOf("a" to "b"))
+        val geometry = pGeom(0.0, 0.0)
+
+        val mapData = MutableMapDataWithGeometry().apply { put(element, geometry) }
+        val bbox = bbox()
+
+        val alwaysApplicableQuests = listOf(
+            osmQuest(ApplicableQuestType, NODE, 1),
+            osmQuest(ApplicableQuestType2, NODE, 1),
+        )
+        val previousQuests = alwaysApplicableQuests + osmQuest(OnlyApplicableForTagAQuestType, NODE, 1)
+
+        val updatedElement = node(1, tags = mapOf("b" to "c"))
+        val updatedMapData = MutableMapDataWithGeometry().apply { put(updatedElement, geometry) }
+        // quest that is not applicable any more should not appear again
+        val solvedQuest = osmQuest(OnlyApplicableForTagAQuestType, NODE, 1)
+        val wantedVisibleQuests = previousQuests - solvedQuest
+
+        // old quests are in DB
+        on(db.getAllInBBox(bbox)).thenReturn(previousQuests)
+        // old quests for element to be updated
+        on(db.getAllForElements(listOf(ElementKey(NODE, 1)))).thenReturn(previousQuests)
+        // updated map data, only returned when creating a quest for single element
+        on(mapDataSource.getMapDataWithGeometry(any())).thenReturn(updatedMapData)
+
+        val visibleQuests = mutableSetOf<OsmQuest>()
+        on(listener.onUpdated(any(), any())).then {
+            it.getArgument<List<OsmQuestKey>>(1).forEach { deleted -> visibleQuests.removeAll { it.key == deleted } }
+            visibleQuests.addAll(it.getArgument<List<OsmQuest>>(0))
+        }
+
+        // map data was downloaded and persisted, now calling listener
+        val j1 = launch { mapDataListener.onReplacedForBBox(bbox, mapData) }
+
+        val j2 = launch {
+//            delay(10) // try waiting a bit, fails otherwise because createQuestsForBBox takes so long
+            // now quest for element 1 solved, calling onUpdated
+            mapDataListener.onUpdated(updatedMapData, emptyList())
+        }
+
+        listOf(j1, j2).joinAll()
+        println(visibleQuests.map { it.key }.sortedBy { it.hashCode() })
+        println(wantedVisibleQuests.map { it.key }.sortedBy { it.hashCode() })
+
+        val orderVerifier = inOrder(listener)
+        orderVerifier.verify(listener).onUpdated(
+            // changes from onReplacedForBBox
+            addedQuests = argThat { it.containsExactlyInAnyOrder(previousQuests) },
+            deletedQuestKeys = eq(emptyList())
+        )
+        orderVerifier.verify(listener).onUpdated(
+            // solved quest is removed (and existing ones are still applicable and thus "added" again)
+            addedQuests = argThat { it.containsExactlyInAnyOrder(previousQuests - solvedQuest) },
+            deletedQuestKeys = eq(listOf(solvedQuest.key))
+        )
+        assertTrue(visibleQuests.containsExactlyInAnyOrder(wantedVisibleQuests))
+    }
 }
 
 private fun questEntry(
@@ -386,4 +453,8 @@ private object NotApplicableQuestType : TestQuestTypeA() {
 private object ComplexQuestTypeApplicableToNode42 : TestQuestTypeA() {
     override fun isApplicableTo(element: Element): Boolean? = null
     override fun getApplicableElements(mapData: MapDataWithGeometry) = listOf(node(42))
+}
+
+private object OnlyApplicableForTagAQuestType : TestQuestTypeA() {
+    override fun isApplicableTo(element: Element) = element.tags.containsKey("a")
 }
